@@ -15,9 +15,17 @@ struct XLSWorkbookParser {
 
     static func parse(workbookStream: Data) throws -> XLSWorkbook {
         let (globals, _) = try parseGlobals(streamBytes: workbookStream)
-        let sheets = globals.bounds.map { XLSSheet(name: $0.name, grid: [:]) }
+
+        // NEW: read each sheet and build the sparse grid
+        var sheets: [XLSSheet] = []
+        for b in globals.bounds {
+            let grid = XLSSheetReader.readSheet(bytes: workbookStream, offset: b.streamOffset, sst: globals.sst)
+            sheets.append(XLSSheet(name: b.name, grid: grid))
+        }
         return XLSWorkbook(sheets: sheets)
     }
+
+    // === Globals code unchanged (safe + index-based) ===
 
     private static func parseGlobals(streamBytes: Data) throws -> (WorkbookGlobals, BIFFStream) {
         let s = BIFFStream(streamBytes)
@@ -42,13 +50,9 @@ struct XLSWorkbookParser {
         return (WorkbookGlobals(sst: sst, bounds: bounds), s)
     }
 
-    // MARK: - BOUNDSHEET
-
     private static func parseBoundSheet(_ d: Data) -> BoundSheet? {
         guard d.count >= 8, let off32 = LEb.u32(d, 0) else { return nil }
         let off = Int(off32)
-
-        // cch and flags must use index-aware access
         guard
             let cchByte = LEb.u8(d, 6),
             let flags   = LEb.u8(d, 7)
@@ -59,21 +63,18 @@ struct XLSWorkbookParser {
         if isUnicode {
             let need = 8 + cch * 2
             guard need <= d.count else { return nil }
-            let s = d.startIndex + 8
-            let e = s + cch * 2
+            let s = d.startIndex + 8, e = s + cch * 2
             let name = String(data: d[s..<e], encoding: .utf16LittleEndian) ?? "Sheet"
             return BoundSheet(name: name, streamOffset: off)
         } else {
             let need = 8 + cch
             guard need <= d.count else { return nil }
-            let s = d.startIndex + 8
-            let e = s + cch
+            let s = d.startIndex + 8, e = s + cch
             let name = String(data: d[s..<e], encoding: .ascii) ?? "Sheet"
             return BoundSheet(name: name, streamOffset: off)
         }
     }
 
-    // MARK: - SST (basic)
     private static func parseSST(first: BIFFRecord, stream: BIFFStream) throws -> [String] {
         guard first.data.count >= 8, let unique = LEb.u32(first.data, 4) else { return [] }
         var remainingUnique = Int(unique)
@@ -84,12 +85,10 @@ struct XLSWorkbookParser {
         func pullString() -> String? {
             guard let cchLE = LEb.u16(chunk, pos) else { return nil }
             pos += 2
-            // flags byte
             guard let flags = LEb.u8(chunk, pos) else { return nil }
             pos += 1
             let isUnicode = (flags & 0x01) != 0
             let bytesNeeded = isUnicode ? Int(cchLE) * 2 : Int(cchLE)
-            // slice safely
             let s = chunk.startIndex + pos
             let e = s + bytesNeeded
             guard e <= chunk.endIndex else { return nil }
