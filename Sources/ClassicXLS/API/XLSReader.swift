@@ -1,4 +1,3 @@
-
 import Foundation
 
 // MARK: - Errors
@@ -33,8 +32,8 @@ extension XLSReadError: Equatable {
 // MARK: - Public Facade
 
 public enum XLSReader {
-    /// Opens a legacy .xls file and returns a workbook.
-    /// Step 2 extracts the OLE "Workbook"/"Book" stream; Step 3 parses globals (sheet names).
+    /// Opens a legacy .xls file.
+    /// Step 2 extracts the OLE "Workbook"/"Book" stream; Step 3 parses sheet names.
     public static func read(url: URL) throws -> XLSWorkbook {
         let cfb = try CFBFile(fileURL: url)
 
@@ -48,7 +47,7 @@ public enum XLSReader {
             throw XLSReadError.workbookStreamMissing
         }
 
-        // Parse globals (BOUNDSHEET + basic SST)
+        // Parse globals (BOUNDSHEET + minimal SST)
         let wb = try XLSWorkbookParser.parse(workbookStream: wbStream)
         #if DEBUG
         print("ClassicXLS: workbook has \(wb.sheets.count) sheets")
