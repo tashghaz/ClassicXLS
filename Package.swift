@@ -15,7 +15,7 @@ let package = Package(
     targets: [
         .target(
             name: "ClassicXLS",
-            resources: [.process("Resources")] // for test fixtures later
+//            resources: [.process("Resources")] // for test fixtures later
         ),
         .testTarget(
             name: "ClassicXLSTests",
