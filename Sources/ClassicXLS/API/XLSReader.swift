@@ -20,7 +20,6 @@ public enum XLSReadError: Error, CustomStringConvertible {
     }
 }
 
-// Handy for tests
 extension XLSReadError: Equatable {
     public static func == (lhs: XLSReadError, rhs: XLSReadError) -> Bool {
         switch (lhs, rhs) {
@@ -34,8 +33,8 @@ extension XLSReadError: Equatable {
 // MARK: - Public Facade
 
 public enum XLSReader {
-    /// Opens a legacy .xls file.
-    /// Step 2: extracts the OLE "Workbook"/"Book" BIFF stream (parsing comes next).
+    /// Opens a legacy .xls file and returns a workbook.
+    /// Step 2 extracts the OLE "Workbook"/"Book" stream; Step 3 parses globals (sheet names).
     public static func read(url: URL) throws -> XLSWorkbook {
         let cfb = try CFBFile(fileURL: url)
 
@@ -49,13 +48,11 @@ public enum XLSReader {
             throw XLSReadError.workbookStreamMissing
         }
 
-        // TODO (Step 3/4): parse `wbStream` (SST, BOUNDSHEET, then sheets)
-        _ = wbStream
+        // Parse globals (BOUNDSHEET + basic SST)
+        let wb = try XLSWorkbookParser.parse(workbookStream: wbStream)
         #if DEBUG
-        print("ClassicXLS: extracted Workbook stream, bytes=\(wbStream.count)")
+        print("ClassicXLS: workbook has \(wb.sheets.count) sheets")
         #endif
-
-        // Temporary stub so the package builds/links with callers
-        return XLSWorkbook(sheets: [])
+        return wb
     }
 }

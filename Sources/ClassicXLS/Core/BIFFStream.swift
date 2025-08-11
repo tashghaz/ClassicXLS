@@ -1,10 +1,16 @@
 
 import Foundation
 
-// BIFF record iterator (to be implemented in Step 3)
+// Little-endian helpers just for this file
+private enum LEb {
+    static func u16(_ d: Data, _ o: Int) -> UInt16 { d.withUnsafeBytes { $0.load(fromByteOffset: o, as: UInt16.self) } }
+    static func u32(_ d: Data, _ o: Int) -> UInt32 { d.withUnsafeBytes { $0.load(fromByteOffset: o, as: UInt32.self) } }
+}
+
 struct BIFFRecord {
-    let sid: UInt16
-    let data: Data
+    let sid: UInt16         // record id
+    let data: Data          // payload (len bytes)
+    let startOffset: Int    // absolute stream offset of this record header
 }
 
 final class BIFFStream {
@@ -14,15 +20,16 @@ final class BIFFStream {
 
     func next() -> BIFFRecord? {
         guard offset + 4 <= bytes.count else { return nil }
-        let sid = UInt16(littleEndian: bytes.withUnsafeBytes { $0.load(fromByteOffset: offset, as: UInt16.self) })
-        let lenLE = bytes.withUnsafeBytes { $0.load(fromByteOffset: offset+2, as: UInt16.self) }
-        let len = Int(UInt16(littleEndian: lenLE))
-        let start = offset + 4
-        let end = start + len
+        let sid = UInt16(littleEndian: LEb.u16(bytes, offset))
+        let len = Int(UInt16(littleEndian: LEb.u16(bytes, offset + 2)))
+        let start = offset
+        let payloadStart = offset + 4
+        let end = payloadStart + len
         guard end <= bytes.count else { return nil }
         offset = end
-        return BIFFRecord(sid: sid, data: bytes[start..<end])
+        return BIFFRecord(sid: sid, data: bytes[payloadStart..<end], startOffset: start)
     }
 
     func seek(to absoluteOffset: Int) { offset = absoluteOffset }
+    var isAtEnd: Bool { offset >= bytes.count }
 }
