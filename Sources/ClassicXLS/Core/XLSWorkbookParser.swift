@@ -47,20 +47,28 @@ struct XLSWorkbookParser {
     private static func parseBoundSheet(_ d: Data) -> BoundSheet? {
         guard d.count >= 8, let off32 = LEb.u32(d, 0) else { return nil }
         let off = Int(off32)
-        guard d.count >= 8 else { return nil }
-        let cch = Int(d[6])
-        let flags = d[7]
+
+        // cch and flags must use index-aware access
+        guard
+            let cchByte = LEb.u8(d, 6),
+            let flags   = LEb.u8(d, 7)
+        else { return nil }
+        let cch = Int(cchByte)
         let isUnicode = (flags & 0x01) != 0
 
         if isUnicode {
             let need = 8 + cch * 2
             guard need <= d.count else { return nil }
-            let name = String(data: d[8..<need], encoding: .utf16LittleEndian) ?? "Sheet"
+            let s = d.startIndex + 8
+            let e = s + cch * 2
+            let name = String(data: d[s..<e], encoding: .utf16LittleEndian) ?? "Sheet"
             return BoundSheet(name: name, streamOffset: off)
         } else {
             let need = 8 + cch
             guard need <= d.count else { return nil }
-            let name = String(data: d[8..<need], encoding: .ascii) ?? "Sheet"
+            let s = d.startIndex + 8
+            let e = s + cch
+            let name = String(data: d[s..<e], encoding: .ascii) ?? "Sheet"
             return BoundSheet(name: name, streamOffset: off)
         }
     }
@@ -76,12 +84,16 @@ struct XLSWorkbookParser {
         func pullString() -> String? {
             guard let cchLE = LEb.u16(chunk, pos) else { return nil }
             pos += 2
-            guard pos < chunk.count else { return nil }
-            let flags = chunk[pos]; pos += 1
+            // flags byte
+            guard let flags = LEb.u8(chunk, pos) else { return nil }
+            pos += 1
             let isUnicode = (flags & 0x01) != 0
             let bytesNeeded = isUnicode ? Int(cchLE) * 2 : Int(cchLE)
-            guard pos + bytesNeeded <= chunk.count else { return nil }
-            let data = chunk[pos..<(pos + bytesNeeded)]
+            // slice safely
+            let s = chunk.startIndex + pos
+            let e = s + bytesNeeded
+            guard e <= chunk.endIndex else { return nil }
+            let data = chunk[s..<e]
             pos += bytesNeeded
             return isUnicode
                 ? (String(data: data, encoding: .utf16LittleEndian) ?? "")
