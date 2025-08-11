@@ -8,21 +8,14 @@ private enum BID: UInt16 {
     case BOUNDSHEET = 0x0085
 }
 
-fileprivate struct BoundSheet {
-    let name: String
-    let streamOffset: Int
-}
-
-fileprivate struct WorkbookGlobals {
-    let sst: [String]
-    let bounds: [BoundSheet]
-}
+fileprivate struct BoundSheet { let name: String; let streamOffset: Int }
+fileprivate struct WorkbookGlobals { let sst: [String]; let bounds: [BoundSheet] }
 
 struct XLSWorkbookParser {
 
     static func parse(workbookStream: Data) throws -> XLSWorkbook {
         let (globals, _) = try parseGlobals(streamBytes: workbookStream)
-        let sheets: [XLSSheet] = globals.bounds.map { XLSSheet(name: $0.name, grid: [:]) }
+        let sheets = globals.bounds.map { XLSSheet(name: $0.name, grid: [:]) }
         return XLSWorkbook(sheets: sheets)
     }
 
@@ -32,7 +25,8 @@ struct XLSWorkbookParser {
         var bounds: [BoundSheet] = []
 
         while let rec = s.next() {
-            switch BID(rawValue: rec.sid) {
+            guard let id = BID(rawValue: rec.sid) else { continue }
+            switch id {
             case .BOF:
                 break
             case .SST:
@@ -51,9 +45,8 @@ struct XLSWorkbookParser {
     // MARK: - BOUNDSHEET
 
     private static func parseBoundSheet(_ d: Data) -> BoundSheet? {
-        guard d.count >= 8, let offU32 = LEb.u32(d, 0) else { return nil }
-        let off = Int(offU32)
-
+        guard d.count >= 8, let off32 = LEb.u32(d, 0) else { return nil }
+        let off = Int(off32)
         guard d.count >= 8 else { return nil }
         let cch = Int(d[6])
         let flags = d[7]
@@ -76,7 +69,7 @@ struct XLSWorkbookParser {
     private static func parseSST(first: BIFFRecord, stream: BIFFStream) throws -> [String] {
         guard first.data.count >= 8, let unique = LEb.u32(first.data, 4) else { return [] }
         var remainingUnique = Int(unique)
-        var strings: [String] = []
+        var out: [String] = []
         var chunk = first.data
         var pos = 8
 
@@ -97,7 +90,7 @@ struct XLSWorkbookParser {
 
         while remainingUnique > 0 {
             if let s = pullString() {
-                strings.append(s)
+                out.append(s)
                 remainingUnique -= 1
             } else {
                 guard let cont = stream.next(), cont.sid == BID.CONTINUE.rawValue else { break }
@@ -105,6 +98,6 @@ struct XLSWorkbookParser {
                 pos = 0
             }
         }
-        return strings
+        return out
     }
 }

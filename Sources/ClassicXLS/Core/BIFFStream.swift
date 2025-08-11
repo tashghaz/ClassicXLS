@@ -1,21 +1,21 @@
-
 import Foundation
 
-// Safe little-endian reads (no alignment assumptions; never traps)
+// Ultra-safe little-endian reads (no alignment assumptions, no overlapping access)
 enum LEb {
     @inline(__always) static func u16(_ d: Data, _ o: Int) -> UInt16? {
-        guard o + 2 <= d.count else { return nil }
-        let b0 = UInt16(d[o])
-        let b1 = UInt16(d[o + 1]) << 8
-        return b0 | b1
+        guard o >= 0, o + 2 <= d.count else { return nil }
+        var tmp = [UInt8](repeating: 0, count: 2)
+        d.copyBytes(to: &tmp, from: o..<(o + 2))
+        return UInt16(tmp[0]) | (UInt16(tmp[1]) << 8)
     }
     @inline(__always) static func u32(_ d: Data, _ o: Int) -> UInt32? {
-        guard o + 4 <= d.count else { return nil }
-        let b0 = UInt32(d[o])
-        let b1 = UInt32(d[o + 1]) << 8
-        let b2 = UInt32(d[o + 2]) << 16
-        let b3 = UInt32(d[o + 3]) << 24
-        return b0 | b1 | b2 | b3
+        guard o >= 0, o + 4 <= d.count else { return nil }
+        var tmp = [UInt8](repeating: 0, count: 4)
+        d.copyBytes(to: &tmp, from: o..<(o + 4))
+        return UInt32(tmp[0])
+             | (UInt32(tmp[1]) << 8)
+             | (UInt32(tmp[2]) << 16)
+             | (UInt32(tmp[3]) << 24)
     }
 }
 
@@ -48,6 +48,6 @@ final class BIFFStream {
         return BIFFRecord(sid: sid, data: bytes[payloadStart..<end], startOffset: start)
     }
 
-    func seek(to absoluteOffset: Int) { offset = absoluteOffset }
+    func seek(to absoluteOffset: Int) { offset = max(0, absoluteOffset) }
     var isAtEnd: Bool { offset >= bytes.count }
 }
