@@ -1,9 +1,3 @@
-//
-//  File.swift
-//  ClassicXLS
-//
-//  Created by Artashes Ghazaryan on 8/11/25.
-//
 
 import Foundation
 
