@@ -1,146 +1,123 @@
 import Foundation
 
-/// Builds a single BIFF5 **worksheet** stream as `Data`.
-/// This does **not** build the workbook globals or OLE container.
-/// Rows/columns are zero-based at the BIFF level:
-/// - We place headers at row 0, **starting at column 1 (B)** to match your reader convention.
-/// - We place data rows at **row 1..**, same columns.
+/// Builds a single BIFF5 worksheet stream (BOF → DIMENSIONS → cells → EOF).
+/// NOTE: This is just the worksheet stream. It must be wrapped in a BIFF5
+/// workbook stream, then into an OLE/CFB container to become a real .xls.
 enum BIFFWorksheetBuilder {
 
-    // MARK: - Public API
-
-    /// Convert headers + rows to a BIFF5 worksheet stream.
+    /// Headers go on row 0, columns **A..**; data starts at row 1.
+    /// (Starting at A fixes the “ÿÿÿ…” garbage some apps showed when colMin ≠ 0.)
     static func makeWorksheetStream(sheetName: String,
                                     headers: [String],
                                     rows: [[String]]) -> Data {
-        var worksheetData = Data()
-        appendBOFWorksheet(to: &worksheetData)
-        appendDimensions(headers: headers, rows: rows, to: &worksheetData)
-        appendHeaderRow(headers, to: &worksheetData)
-        appendDataRows(rows, to: &worksheetData)
-        appendEOF(to: &worksheetData)
-        return worksheetData
+        var s = Data()
+        s.append(recBOF(.worksheet))
+        s.append(recDimensions(headerCount: headers.count, rowCount: rows.count))
+        s.append(recHeaderRow(headers))
+        s.append(recDataRows(rows))
+        s.append(recEOF())
+        return s
     }
 
-    // MARK: - Record builders
+    // MARK: records
 
-    /// BOF (worksheet) — sid 0x0809, type 0x0010, BIFF5
-    private static func appendBOFWorksheet(to data: inout Data) {
-        var payload = Data()
-        payload.append(le16(0x0500))  // BIFF5
-        payload.append(le16(0x0010))  // type: worksheet
-        payload.append(le16(0))       // build id
-        payload.append(le16(0))       // build year
-        payload.append(le32(0))       // file history flags
-        payload.append(le32(0))       // lowest Excel ver
-        data.append(record(sid: 0x0809, payload: payload))
+    private enum BOFType: UInt16 { case worksheet = 0x0010 }
+
+    private static func recBOF(_ t: BOFType) -> Data {
+        var p = Data()
+        p.append(le16(0x0500))         // BIFF5
+        p.append(le16(t.rawValue))     // worksheet
+        p.append(le16(0))              // build id
+        p.append(le16(0))              // build year
+        p.append(le32(0))              // history flags
+        p.append(le32(0))              // lowest Excel ver
+        return rec(0x0809, p)
     }
 
-    /// DIMENSIONS — sid 0x0200
-    /// rowMin,rowMax (exclusive), colMin,colMax (exclusive), flags
-    private static func appendDimensions(headers: [String],
-                                         rows: [[String]],
-                                         to data: inout Data) {
-        let firstRowIndex: UInt32 = 0               // header row
-        let firstDataRowIndex: UInt32 = 1           // data starts after header
-        let lastRowExclusive: UInt32 = firstDataRowIndex + UInt32(rows.count)
+    /// DIMENSIONS: rowMin,rowMax(exclusive), colMin,colMax(exclusive), flags
+    private static func recDimensions(headerCount: Int, rowCount: Int) -> Data {
+        let rowMin: UInt32 = 0
+        let rowMax: UInt32 = UInt32(1 + rowCount) // header + data rows
+        let colMin: UInt16 = 0                    // start at **A** (fixes garbled top row)
+        let colMax: UInt16 = UInt16(max(headerCount, rowCount > 0 ? (rowsMaxWidth(rowCount) ?? headerCount) : headerCount))
 
-        let firstColumnIndex: UInt16 = 1            // start at column B
-        let tableWidth: Int = max(headers.count, rows.first?.count ?? 0)
-        let lastColumnExclusive: UInt16 = UInt16(firstColumnIndex + UInt16(tableWidth))
-
-        var payload = Data()
-        payload.append(le32(firstRowIndex))
-        payload.append(le32(lastRowExclusive))
-        payload.append(le16(firstColumnIndex))
-        payload.append(le16(lastColumnExclusive))
-        payload.append(le16(0)) // flags/reserved
-        data.append(record(sid: 0x0200, payload: payload))
+        var p = Data()
+        p.append(le32(rowMin))
+        p.append(le32(rowMax))
+        p.append(le16(colMin))
+        p.append(le16(colMin + colMax)) // exclusive upper bound
+        p.append(le16(0))
+        return rec(0x0200, p)
     }
 
-    /// Header cells at row 0, columns B.. (1..)
-    private static func appendHeaderRow(_ headers: [String], to data: inout Data) {
-        let headerRowIndex = 0
-        let firstColumnIndex = 1
-        for (offset, text) in headers.enumerated() {
-            let col = firstColumnIndex + offset
-            data.append(labelCell(row: headerRowIndex, column: col, text: text))
-        }
-    }
+    private static func rowsMaxWidth(_ rc: Int) -> Int? { rc > 0 ? nil : nil } // keep simple
 
-    /// Data rows at row 1.., columns B.. (1..)
-    private static func appendDataRows(_ rows: [[String]], to data: inout Data) {
-        let firstDataRowIndex = 1
-        let firstColumnIndex = 1
-        for (rowOffset, rowValues) in rows.enumerated() {
-            let rowIndex = firstDataRowIndex + rowOffset
-            for (colOffset, cell) in rowValues.enumerated() {
-                let colIndex = firstColumnIndex + colOffset
-                if let numeric = Double(cell.replacingOccurrences(of: ",", with: ".")) {
-                    data.append(numberCell(row: rowIndex, column: colIndex, value: numeric))
-                } else {
-                    data.append(labelCell(row: rowIndex, column: colIndex, text: cell))
-                }
-            }
-        }
-    }
-
-    /// EOF — sid 0x000A
-    private static func appendEOF(to data: inout Data) {
-        data.append(record(sid: 0x000A, payload: Data()))
-    }
-
-    // MARK: - Cell record helpers
-
-    /// NUMBER (sid 0x0203): row(2), col(2), xf(2), IEEE754 double (8)
-    private static func numberCell(row: Int, column: Int, value: Double) -> Data {
-        var payload = Data()
-        payload.append(le16(UInt16(row)))
-        payload.append(le16(UInt16(column)))
-        payload.append(le16(0))                        // XF index
-        payload.append(le64(value.bitPattern))         // raw 8 bytes of double
-        return record(sid: 0x0203, payload: payload)
-    }
-
-    /// LABEL (sid 0x0204): row(2), col(2), xf(2), len(1), bytes (8-bit)
-    /// BIFF5 uses an 8-bit length; we cap to 255 bytes.
-    private static func labelCell(row: Int, column: Int, text: String) -> Data {
-        var payload = Data()
-        payload.append(le16(UInt16(row)))
-        payload.append(le16(UInt16(column)))
-        payload.append(le16(0)) // XF index
-
-        var bytes = Array(text.utf8)
-        if bytes.count > 255 { bytes = Array(bytes.prefix(255)) }
-        payload.append(UInt8(bytes.count))
-        payload.append(contentsOf: bytes)
-
-        return record(sid: 0x0204, payload: payload)
-    }
-
-    // MARK: - Low-level BIFF helpers
-
-    /// Build a BIFF record: [sid:2][length:2][payload]
-    private static func record(sid: UInt16, payload: Data) -> Data {
+    private static func recHeaderRow(_ headers: [String]) -> Data {
         var out = Data()
-        out.append(le16(sid))
-        out.append(le16(UInt16(payload.count)))
-        out.append(payload)
+        let r = 0
+        for (c, text) in headers.enumerated() {
+            out.append(recLabel(row: r, col: c, text: text))
+        }
         return out
     }
 
-    private static func le16(_ value: UInt16) -> Data {
-        var v = value.littleEndian
-        return Data(bytes: &v, count: MemoryLayout<UInt16>.size)
+    private static func recDataRows(_ rows: [[String]]) -> Data {
+        var out = Data()
+        for (ri, row) in rows.enumerated() {
+            let r = 1 + ri
+            for (c, raw) in row.enumerated() {
+                if let d = Double(raw.replacingOccurrences(of: ",", with: ".")) {
+                    out.append(recNumber(row: r, col: c, value: d))
+                } else {
+                    out.append(recLabel(row: r, col: c, text: raw))
+                }
+            }
+        }
+        return out
     }
 
-    private static func le32(_ value: UInt32) -> Data {
-        var v = value.littleEndian
-        return Data(bytes: &v, count: MemoryLayout<UInt32>.size)
+    private static func recNumber(row: Int, col: Int, value: Double) -> Data {
+        var p = Data()
+        p.append(le16(UInt16(row)))
+        p.append(le16(UInt16(col)))
+        p.append(le16(0))                    // XF index
+        p.append(le64(value.bitPattern))     // raw IEEE754
+        return rec(0x0203, p)                // NUMBER
     }
 
-    private static func le64(_ value: UInt64) -> Data {
-        var v = value.littleEndian
-        return Data(bytes: &v, count: MemoryLayout<UInt64>.size)
+    /// LABEL: 8-bit length + bytes encoded with Windows-1252 (BIFF5 single-byte strings)
+    private static func recLabel(row: Int, col: Int, text: String) -> Data {
+        var p = Data()
+        p.append(le16(UInt16(row)))
+        p.append(le16(UInt16(col)))
+        p.append(le16(0))                    // XF index
+        let bytes = dataCP1252(text, max: 255)
+        p.append(UInt8(bytes.count))
+        p.append(contentsOf: bytes)
+        return rec(0x0204, p)                // LABEL
     }
+
+    private static func recEOF() -> Data { rec(0x000A, Data()) }
+
+    // MARK: helpers
+
+    private static func dataCP1252(_ s: String, max: Int) -> [UInt8] {
+        if let d = s.data(using: .windowsCP1252, allowLossyConversion: true) {
+            return Array(d.prefix(max))
+        }
+        // fallback: replace unsupported chars with "?"
+        return s.map { $0.isASCII ? $0.asciiValue! : 0x3F }.prefix(max).map { $0 }
+    }
+
+    private static func rec(_ sid: UInt16, _ payload: Data) -> Data {
+        var d = Data()
+        d.append(le16(sid))
+        d.append(le16(UInt16(payload.count)))
+        d.append(payload)
+        return d
+    }
+
+    private static func le16(_ v: UInt16) -> Data { var x = v.littleEndian; return Data(bytes: &x, count: 2) }
+    private static func le32(_ v: UInt32) -> Data { var x = v.littleEndian; return Data(bytes: &x, count: 4) }
+    private static func le64(_ v: UInt64) -> Data { var x = v.littleEndian; return Data(bytes: &x, count: 8) }
 }
