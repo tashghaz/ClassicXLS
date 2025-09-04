@@ -1,198 +1,191 @@
 import Foundation
 
-/// Minimal OLE/CFB writer for one regular FAT stream named `streamName`.
-/// We pad the stream to >= 4096 bytes so it goes into regular FAT
-/// (no MiniFAT), which keeps the writer small and Excel-compatible.
+/// Minimal OLE/CFB writer for a *single* stream (e.g. "Book").
+/// - 512-byte sectors (ver 3)
+/// - No MiniFAT (we pad the stream to ≥4096 and sector-align)
+/// - Directory: Root Entry + your stream
 enum CFBWriter {
-    private static let sectorSize = 512
-    private static let ENDOFCHAIN: UInt32 = 0xFFFFFFFE
-    private static let FATSECT:    UInt32 = 0xFFFFFFFD
-    private static let FREESECT:   UInt32 = 0xFFFFFFFF
 
-    /// Write a single Compound File with one stream (e.g. "Book") to disk.
-    static func writeSingleStream(streamName: String, stream: Data, to url: URL) throws {
-        // 1) Ensure the stream is large enough for regular FAT (>= 4096 bytes)
-        var payload = stream
-        if payload.count < 4096 {
-            payload.append(Data(repeating: 0, count: 4096 - payload.count))
+    /// Old API your code calls.
+    static func writeSingleStream(streamName: String = "Book",
+                                  stream: Data,
+                                  to url: URL) throws {
+        let file = makeOLEFile(streamName: streamName, stream: stream)
+        try file.write(to: url)
+    }
+
+    // MARK: builder
+
+    static func makeOLEFile(streamName: String = "Book", stream: Data) -> Data {
+        let sector = 512
+        let entriesPerFATSector = sector / 4
+
+        // 1) Pad main stream to ≥4096 and sector-align → no MiniFAT.
+        var main = stream
+        if main.count < 4096 { main.append(Data(repeating: 0, count: 4096 - main.count)) }
+        pad(&main, to: sector)
+
+        // 2) Directory stream (Root + stream)
+        let mainFirstSector = 0
+        let dir = makeDirectory(streamName: streamName,
+                                mainStart: Int32(mainFirstSector),
+                                mainSize: UInt64(main.count),
+                                sector: sector)
+
+        let mainSectors = main.count / sector
+        let dirSectors  = dir.count  / sector
+
+        // 3) FAT sectors required
+        var fatSectors = 1
+        while (mainSectors + dirSectors + fatSectors) > fatSectors * entriesPerFATSector {
+            fatSectors += 1
         }
 
-        // 2) Build the Directory stream (Root + stream entry)
-        let directoryStream = buildDirectory(streamName: streamName, streamSize: UInt64(payload.count))
+        let dirFirstSector = mainFirstSector + mainSectors
+        let fatFirstSector = dirFirstSector + dirSectors
+        let totalSectors   = mainSectors + dirSectors + fatSectors
 
-        // 3) Split payloads into 512-byte sectors
-        let payloadSectors = splitIntoSectors(payload)
-        let directorySectors = splitIntoSectors(directoryStream)
+        // 4) FAT table
+        var fat = [UInt32](repeating: FREE, count: totalSectors)
 
-        // Layout after the 512-byte file header:
-        // [Payload sectors][Directory sectors][FAT sector]
-        let payloadStartSID = 0
-        let directoryStartSID = payloadSectors.count
-        let fatStartSID = directoryStartSID + directorySectors.count
-
-        // 4) FAT (one sector is enough for small files: 512/4 = 128 entries)
-        let totalSectors = payloadSectors.count + directorySectors.count + 1 // +1 FAT
-        precondition(totalSectors <= 128, "File too large for this minimal writer (needs >1 FAT sector).")
-
-        var fatEntries = Array(repeating: FREESECT, count: totalSectors)
-
-        // Chain payload sectors
-        for i in 0..<payloadSectors.count {
-            fatEntries[payloadStartSID + i] = (i == payloadSectors.count - 1)
-                ? ENDOFCHAIN
-                : UInt32(payloadStartSID + i + 1)
+        // chain main
+        for i in 0..<mainSectors {
+            let sid = mainFirstSector + i
+            fat[sid] = (i == mainSectors - 1) ? EOC : UInt32(sid + 1)
         }
+        // chain directory
+        for i in 0..<dirSectors {
+            let sid = dirFirstSector + i
+            fat[sid] = (i == dirSectors - 1) ? EOC : UInt32(sid + 1)
+        }
+        // mark FAT sectors
+        for i in 0..<fatSectors { fat[fatFirstSector + i] = FATSECT }
 
-        // Directory sector (single chain)
-        fatEntries[directoryStartSID] = ENDOFCHAIN
+        // serialize FAT
+        var fatData = Data(capacity: fatSectors * sector)
+        for v in fat {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { fatData.append(contentsOf: $0) }
+        }
+        pad(&fatData, to: sector)
 
-        // FAT sector marks itself
-        fatEntries[fatStartSID] = FATSECT
+        // 5) header
+        let hdr = makeHeader(firstDirSector: Int32(dirFirstSector),
+                             fatSectorCount: fatSectors,
+                             fatSectorIndices: (0..<fatSectors).map { UInt32(fatFirstSector + $0) })
 
-        // 5) Build file header
-        let header = buildHeader(
-            numberOfFATSectors: 1,
-            firstDirectorySID: UInt32(directoryStartSID),
-            firstMiniFATSID: ENDOFCHAIN, numberOfMiniFATSectors: 0,
-            firstDIFATSID: ENDOFCHAIN,   numberOfDIFATSectors: 0,
-            firstFATSIDInDIFAT: UInt32(fatStartSID)
-        )
-
-        // 6) Assemble file bytes
+        // 6) assemble
         var file = Data()
-        file.append(header)
-        payloadSectors.forEach { file.append($0) }
-        directorySectors.forEach { file.append($0) }
-        file.append(buildFATSector(fatEntries))
-
-        try file.write(to: url, options: .atomic)
+        file.append(hdr)
+        file.append(main)
+        file.append(dir)
+        file.append(fatData)
+        return file
     }
 
-    // MARK: - Header / FAT
+    // MARK: directory (2 entries)
 
-    private static func buildHeader(
-        numberOfFATSectors: UInt32,
-        firstDirectorySID: UInt32,
-        firstMiniFATSID: UInt32, numberOfMiniFATSectors: UInt32,
-        firstDIFATSID: UInt32,   numberOfDIFATSectors: UInt32,
-        firstFATSIDInDIFAT: UInt32
-    ) -> Data {
-        var d = Data(count: sectorSize)
+    private static func makeDirectory(streamName: String,
+                                      mainStart: Int32,
+                                      mainSize: UInt64,
+                                      sector: Int) -> Data {
+        var d = Data(capacity: sector)
 
-        func put<T: FixedWidthInteger>(_ v: T, at offset: Int) {
-            var x = v.littleEndian
-            d.replaceSubrange(offset ..< offset + MemoryLayout<T>.size,
-                              with: Data(bytes: &x, count: MemoryLayout<T>.size))
-        }
+        // entry 0: Root
+        d.append(dirEntry(name: "Root Entry", type: 5,
+                          left: NOSTREAM, right: NOSTREAM, child: 1,
+                          start: NOSTREAM, size: 0))
 
-        // Signature D0 CF 11 E0 A1 B1 1A E1
-        d.replaceSubrange(0..<8, with: Data([0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1]))
+        // entry 1: Your stream (e.g. "Book")
+        d.append(dirEntry(name: streamName, type: 2,
+                          left: NOSTREAM, right: NOSTREAM, child: NOSTREAM,
+                          start: mainStart, size: mainSize))
 
-        // Minor(0x003E), Major(0x0003 => 512-byte sectors)
-        put(UInt16(0x003E), at: 24)
-        put(UInt16(0x0003), at: 26)
-        // Sector sizes
-        put(UInt16(0x0009), at: 28) // sector shift 2^9 = 512
-        put(UInt16(0x0006), at: 30) // mini sector shift 2^6 = 64
-
-        // Directory sectors (v4 only) = 0
-        put(UInt32(0), at: 40)
-        // FAT count
-        put(numberOfFATSectors, at: 44)
-        // First directory sector id
-        put(firstDirectorySID, at: 48)
-        // Transaction signature
-        put(UInt32(0), at: 52)
-        // Mini stream cutoff (4096)
-        put(UInt32(4096), at: 56)
-        // MiniFAT chain
-        put(firstMiniFATSID, at: 60)
-        put(numberOfMiniFATSectors, at: 64)
-        // DIFAT chain
-        put(firstDIFATSID, at: 68)
-        put(numberOfDIFATSectors, at: 72)
-
-        // DIFAT[0..108] table at byte 76 — put our single FAT sector SID, rest FREESECT
-        put(firstFATSIDInDIFAT, at: 76)
-        for i in 1..<109 {
-            put(FREESECT, at: 76 + i * 4)
+        // pad to sectors
+        while d.count % sector != 0 {
+            d.append(Data(repeating: 0, count: 128))
         }
         return d
     }
 
-    private static func buildFATSector(_ entries: [UInt32]) -> Data {
-        var d = Data(capacity: sectorSize)
-        for v in entries {
-            var x = v.littleEndian
-            d.append(Data(bytes: &x, count: 4))
-        }
-        if d.count < sectorSize {
-            d.append(Data(repeating: 0, count: sectorSize - d.count))
-        }
-        return d
-    }
+    private static func dirEntry(name: String, type: UInt8,
+                                 left: Int32, right: Int32, child: Int32,
+                                 start: Int32, size: UInt64) -> Data {
+        var e = Data(capacity: 128)
 
-    // MARK: - Directory (Root + one Stream)
+        let (nameBuf, lenLE) = utf16LEName(name, maxChars: 64)
+        e.append(nameBuf)            // 128-byte name buffer
+        e.append(lenLE)              // length in bytes incl. null
 
-    private static func buildDirectory(streamName: String, streamSize: UInt64) -> Data {
-        var dir = Data()
-        dir.append(buildDirectoryEntry(name: "Root Entry", type: 5, startSector: ENDOFCHAIN, size: 0))
-        dir.append(buildDirectoryEntry(name: streamName, type: 2, startSector: 0, size: streamSize))
-        if dir.count < sectorSize {
-            dir.append(Data(repeating: 0, count: sectorSize - dir.count))
-        }
-        return dir
-    }
-
-    /// Build a 128-byte directory entry.
-    /// type: 5=root, 2=stream
-    private static func buildDirectoryEntry(name: String, type: UInt8, startSector: UInt32, size: UInt64) -> Data {
-        var e = Data(count: 128)
-
-        // Name: UTF-16LE + trailing null, max 32 chars incl null => 64 bytes
-        let trimmed = String(name.prefix(31))
-        let nameLE = (trimmed.data(using: .utf16LittleEndian) ?? Data()) + Data([0, 0])
-        let nameField = nameLE.prefix(64)
-        e.replaceSubrange(0..<nameField.count, with: nameField)
-
-        // Name length (bytes incl null)
-        var nameLenLE = UInt16(nameField.count).littleEndian
-        e.replaceSubrange(64..<66, with: Data(bytes: &nameLenLE, count: 2))
-
-        e[66] = type     // object type
-        e[67] = 0        // color (red/black) — irrelevant here
-
-        // left/right/child = -1
-        e.replaceSubrange(68..<80, with: Data(repeating: 0xFF, count: 12))
-
-        // CLSID(16), state bits(4), timestamps(16) — left zero
-
-        // starting sector id
-        var ss = startSector.littleEndian
-        e.replaceSubrange(116..<120, with: Data(bytes: &ss, count: 4))
-
-        // stream size (bytes)
-        var sz = size.littleEndian
-        e.replaceSubrange(120..<128, with: Data(bytes: &sz, count: 8))
-
+        e.append(type)               // 1=storage 2=stream 5=root
+        e.append(UInt8(0))           // color
+        e.append(int32LE(left))
+        e.append(int32LE(right))
+        e.append(int32LE(child))
+        e.append(Data(repeating: 0, count: 16)) // clsid
+        e.append(uint32LE(0))        // state bits
+        e.append(uint64LE(0))        // create time
+        e.append(uint64LE(0))        // mod time
+        e.append(int32LE(start))
+        e.append(uint64LE(size))
         return e
     }
 
-    // MARK: - Utils
-
-    private static func splitIntoSectors(_ data: Data) -> [Data] {
-        var sectors: [Data] = []
-        var i = 0
-        while i < data.count {
-            let end = min(i + sectorSize, data.count)
-            var chunk = data.subdata(in: i..<end)
-            if chunk.count < sectorSize {
-                chunk.append(Data(repeating: 0, count: sectorSize - chunk.count))
-            }
-            sectors.append(chunk)
-            i = end
+    private static func utf16LEName(_ name: String, maxChars: Int) -> (Data, Data) {
+        let chars = Array(name.utf16.prefix(maxChars - 1))
+        var buf = Data(count: maxChars * 2)
+        for (i, u) in chars.enumerated() {
+            var le = u.littleEndian
+            withUnsafeBytes(of: &le) { buf.replaceSubrange(i*2..<(i*2+2), with: $0) }
         }
-        if sectors.isEmpty { sectors = [Data(repeating: 0, count: sectorSize)] }
-        return sectors
+        let lenBytes = UInt16((chars.count + 1) * 2).littleEndian
+        return (buf, Data(bytes: UnsafePointer([lenBytes]), count: 2))
     }
+
+    // MARK: header (512 bytes)
+
+    private static func makeHeader(firstDirSector: Int32,
+                                   fatSectorCount: Int,
+                                   fatSectorIndices: [UInt32]) -> Data {
+        var h = Data(count: 512)
+        var cur = 0
+        func put(_ d: Data) { h.replaceSubrange(cur..<cur+d.count, with: d); cur += d.count }
+
+        put(Data([0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1]))  // signature
+        put(Data(repeating: 0, count: 16))                    // clsid
+        put(uint16LE(0x003E))                                 // minor
+        put(uint16LE(0x0003))                                 // major (512B sectors)
+        put(uint16LE(0xFFFE))                                 // byte order
+        put(uint16LE(9))                                      // sectorShift=9 → 512
+        put(uint16LE(6))                                      // miniSectorShift=6 → 64
+        put(Data(repeating: 0, count: 6))
+        put(uint32LE(0))                                      // dir sector count (unused)
+        put(uint32LE(UInt32(fatSectorCount)))
+        put(int32LE(firstDirSector))
+        put(uint32LE(0))                                      // transaction sig
+        put(uint32LE(4096))                                   // mini cutoff
+        put(int32LE(NOSTREAM)); put(uint32LE(0))              // miniFAT
+        put(int32LE(NOSTREAM)); put(uint32LE(0))              // DIFAT chain
+
+        // DIFAT[109]
+        var difat = fatSectorIndices + Array(repeating: 0xFFFFFFFF, count: max(0, 109 - fatSectorIndices.count))
+        for i in 0..<109 { put(uint32LE(difat[i])) }
+        return h
+    }
+
+    // MARK: utils
+
+    private static func pad(_ d: inout Data, to size: Int) {
+        let r = d.count % size
+        if r != 0 { d.append(Data(repeating: 0, count: size - r)) }
+    }
+    private static func uint16LE(_ v: UInt16) -> Data { var x = v.littleEndian; return Data(bytes: &x, count: 2) }
+    private static func uint32LE(_ v: UInt32) -> Data { var x = v.littleEndian; return Data(bytes: &x, count: 4) }
+    private static func uint64LE(_ v: UInt64) -> Data { var x = v.littleEndian; return Data(bytes: &x, count: 8) }
+    private static func int32LE(_ v: Int32) -> Data { var x = v.littleEndian; return Data(bytes: &x, count: 4) }
+
+    private static let FREE:    UInt32 = 0xFFFFFFFF
+    private static let EOC:     UInt32 = 0xFFFFFFFE
+    private static let FATSECT: UInt32 = 0xFFFFFFFD
+    private static let NOSTREAM: Int32 = -1
 }
