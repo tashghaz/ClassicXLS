@@ -1,111 +1,122 @@
 import Foundation
 
-/// Builds a single BIFF5 worksheet stream (BOF → DIMENSIONS → cells → EOF).
-/// NOTE: This is just the worksheet stream. It must be wrapped in a BIFF5
-/// workbook stream, then into an OLE/CFB container to become a real .xls.
+/// Builds a single BIFF5 worksheet stream (BOF → DIMENSIONS → ROWs → cells → EOF).
 enum BIFFWorksheetBuilder {
 
-    /// Headers go on row 0, columns **A..**; data starts at row 1.
-    /// (Starting at A fixes the “ÿÿÿ…” garbage some apps showed when colMin ≠ 0.)
+    /// headers on row 0 (columns A..), data rows start at row 1
     static func makeWorksheetStream(sheetName: String,
                                     headers: [String],
                                     rows: [[String]]) -> Data {
-        var s = Data()
-        s.append(recBOF(.worksheet))
-        s.append(recDimensions(headerCount: headers.count, rowCount: rows.count))
-        s.append(recHeaderRow(headers))
-        s.append(recDataRows(rows))
-        s.append(recEOF())
-        return s
-    }
+        var ws = Data()
 
-    // MARK: records
+        ws.append(recBOF(.worksheet))
 
-    private enum BOFType: UInt16 { case worksheet = 0x0010 }
+        // ---- DIMENSIONS (row/col bounds, exclusive upper limits)
+        let maxRowCount = rows.count
+        let maxRowWidth = rows.map { $0.count }.max() ?? 0
+        let width = max(headers.count, maxRowWidth)
+        ws.append(recDimensions(totalDataRows: maxRowCount, width: width))
 
-    private static func recBOF(_ t: BOFType) -> Data {
-        var p = Data()
-        p.append(le16(0x0500))         // BIFF5
-        p.append(le16(t.rawValue))     // worksheet
-        p.append(le16(0))              // build id
-        p.append(le16(0))              // build year
-        p.append(le32(0))              // history flags
-        p.append(le32(0))              // lowest Excel ver
-        return rec(0x0809, p)
-    }
-
-    /// DIMENSIONS: rowMin,rowMax(exclusive), colMin,colMax(exclusive), flags
-    private static func recDimensions(headerCount: Int, rowCount: Int) -> Data {
-        let rowMin: UInt32 = 0
-        let rowMax: UInt32 = UInt32(1 + rowCount) // header + data rows
-        let colMin: UInt16 = 0                    // start at **A** (fixes garbled top row)
-        let colMax: UInt16 = UInt16(max(headerCount, rowCount > 0 ? (rowsMaxWidth(rowCount) ?? headerCount) : headerCount))
-
-        var p = Data()
-        p.append(le32(rowMin))
-        p.append(le32(rowMax))
-        p.append(le16(colMin))
-        p.append(le16(colMin + colMax)) // exclusive upper bound
-        p.append(le16(0))
-        return rec(0x0200, p)
-    }
-
-    private static func rowsMaxWidth(_ rc: Int) -> Int? { rc > 0 ? nil : nil } // keep simple
-
-    private static func recHeaderRow(_ headers: [String]) -> Data {
-        var out = Data()
-        let r = 0
-        for (c, text) in headers.enumerated() {
-            out.append(recLabel(row: r, col: c, text: text))
+        // ---- ROW records (header + each data row)
+        ws.append(recRow(row: 0, width: headers.count))         // header row
+        for (i, row) in rows.enumerated() {
+            ws.append(recRow(row: 1 + i, width: row.count))
         }
-        return out
-    }
 
-    private static func recDataRows(_ rows: [[String]]) -> Data {
-        var out = Data()
+        // ---- header cells (row 0, cols A..)
+        for (c, text) in headers.enumerated() {
+            ws.append(recLabel(row: 0, col: c, text: text))
+        }
+
+        // ---- data cells (row 1.., cols A..)
         for (ri, row) in rows.enumerated() {
             let r = 1 + ri
             for (c, raw) in row.enumerated() {
                 if let d = Double(raw.replacingOccurrences(of: ",", with: ".")) {
-                    out.append(recNumber(row: r, col: c, value: d))
+                    ws.append(recNumber(row: r, col: c, value: d))
                 } else {
-                    out.append(recLabel(row: r, col: c, text: raw))
+                    ws.append(recLabel(row: r, col: c, text: raw))
                 }
             }
         }
-        return out
+
+        ws.append(recEOF())
+        return ws
     }
 
+    // MARK: Records
+
+    private enum BOFType: UInt16 { case worksheet = 0x0010 }
+
+    private static func recBOF(_ type: BOFType) -> Data {
+        var p = Data()
+        p.append(le16(0x0500))             // BIFF5
+        p.append(le16(type.rawValue))      // worksheet
+        p.append(le16(0)); p.append(le16(0))
+        p.append(le32(0)); p.append(le32(0))
+        return rec(0x0809, p)
+    }
+
+    /// DIMENSIONS: rowMin,rowMax(exclusive), colMin,colMax(exclusive), flags
+    private static func recDimensions(totalDataRows: Int, width: Int) -> Data {
+        let rowMin: UInt32 = 0
+        let rowMaxExclusive: UInt32 = UInt32(1 + totalDataRows)   // header + data
+        let colMin: UInt16 = 0                                    // start at A
+        let colMaxExclusive: UInt16 = UInt16(width)               // exclusive!
+
+        var p = Data()
+        p.append(le32(rowMin))
+        p.append(le32(rowMaxExclusive))
+        p.append(le16(colMin))
+        p.append(le16(colMaxExclusive))
+        p.append(le16(0))
+        return rec(0x0200, p)
+    }
+
+    /// ROW: row, colFirst, colLast(exclusive), height, (2B), (4B), flags
+    private static func recRow(row: Int, width: Int) -> Data {
+        var p = Data()
+        p.append(le16(UInt16(row)))
+        p.append(le16(0))                          // first defined column (A)
+        p.append(le16(UInt16(width)))              // last+1
+        p.append(le16(0x00FF))                     // default height (approx)
+        p.append(le16(0))                          // reserved
+        p.append(le32(0))                          // reserved
+        p.append(le16(0))                          // flags
+        return rec(0x0208, p)
+    }
+
+    /// NUMBER: row, col, xf, IEEE754 double
     private static func recNumber(row: Int, col: Int, value: Double) -> Data {
         var p = Data()
         p.append(le16(UInt16(row)))
         p.append(le16(UInt16(col)))
-        p.append(le16(0))                    // XF index
-        p.append(le64(value.bitPattern))     // raw IEEE754
-        return rec(0x0203, p)                // NUMBER
+        p.append(le16(0))                          // XF index
+        p.append(le64(value.bitPattern))
+        return rec(0x0203, p)
     }
 
-    /// LABEL: 8-bit length + bytes encoded with Windows-1252 (BIFF5 single-byte strings)
+    /// LABEL (BIFF5 single-byte text): row, col, xf, len(1), bytes(<=255)
     private static func recLabel(row: Int, col: Int, text: String) -> Data {
         var p = Data()
         p.append(le16(UInt16(row)))
         p.append(le16(UInt16(col)))
-        p.append(le16(0))                    // XF index
+        p.append(le16(0))                          // XF index
         let bytes = dataCP1252(text, max: 255)
         p.append(UInt8(bytes.count))
         p.append(contentsOf: bytes)
-        return rec(0x0204, p)                // LABEL
+        return rec(0x0204, p)
     }
 
     private static func recEOF() -> Data { rec(0x000A, Data()) }
 
-    // MARK: helpers
+    // MARK: Helpers
 
+    /// Windows-1252 bytes, lossy (non-representable chars → "?")
     private static func dataCP1252(_ s: String, max: Int) -> [UInt8] {
         if let d = s.data(using: .windowsCP1252, allowLossyConversion: true) {
             return Array(d.prefix(max))
         }
-        // fallback: replace unsupported chars with "?"
         return s.map { $0.isASCII ? $0.asciiValue! : 0x3F }.prefix(max).map { $0 }
     }
 
