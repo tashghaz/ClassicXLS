@@ -4,10 +4,9 @@ import Foundation
 public enum XLSWriteError: Error {
     case emptySheetName
     case invalidGrid(expectedWidth: Int, gotRowIndex: Int, gotWidth: Int)
-    case notImplemented(String)   // <- temporary, until we add the encoder in Step 1
+    case notImplemented(String)
 }
 
-/// A simple table you want to write into a single worksheet.
 /// - `name`: worksheet/tab name
 /// - `headers`: row 0, starting at column B (we skip column A to match your reader)
 /// - `rows`: data rows (each MUST match headers.count)
