@@ -27,20 +27,31 @@ public enum XLSWriter {
 
     /// Write `sheet` into a new .xls file at `url`.
     /// Step 0: this only validates inputs and throws `.notImplemented`.
-    /// Step 1 will add the real encoder behind this API.
     public static func write(sheet: XLSWriteSheet, to url: URL) throws {
-        // 0) Validate name
-        guard !sheet.name.isEmpty else {
-            throw XLSWriteError.emptySheetName
-        }
-
-        // 1) Validate widths (every row must match headers.count)
-        let expectedWidth = sheet.headers.count
-        for (rowIndex, row) in sheet.rows.enumerated() where row.count != expectedWidth {
-            throw XLSWriteError.invalidGrid(expectedWidth: expectedWidth, gotRowIndex: rowIndex, gotWidth: row.count)
-        }
-
-        // 2) Placeholder until Step 1 (actual BIFF/OLE encoding)
-        throw XLSWriteError.notImplemented("Writer encoder will be added in Step 1.")
+    // 0) Validate
+    guard !sheet.name.isEmpty else {
+        throw XLSWriteError.emptySheetName
     }
+    let expectedWidth = sheet.headers.count
+    for (rowIndex, row) in sheet.rows.enumerated() where row.count != expectedWidth {
+        throw XLSWriteError.invalidGrid(expectedWidth: expectedWidth, gotRowIndex: rowIndex, gotWidth: row.count)
+    }
+
+    // 1) Build the worksheet stream (Step 1)
+    let worksheetData = BIFFWorksheetBuilder.makeWorksheetStream(
+        sheetName: sheet.name,
+        headers: sheet.headers,
+        rows: sheet.rows
+    )
+
+    // 2) Build the workbook stream (Step 2)
+    let workbookData = BIFFWorkbookBuilder.makeWorkbookStream(
+        sheetName: sheet.name,
+        worksheetStream: worksheetData
+    )
+
+    // 3) Stop here in Step 2 (no OLE/CFB yet)
+    //    We'll wrap `workbookData` in an OLE container in Step 3.
+    throw XLSWriteError.notImplemented("Step 2 complete. Next: OLE container in Step 3.")
+}
 }
