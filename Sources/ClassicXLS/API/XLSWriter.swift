@@ -22,14 +22,12 @@ public enum XLSWriter {
             throw XLSWriteError.invalidGrid(expectedWidth: w, gotRowIndex: i, gotWidth: r.count)
         }
 
-        // 1) Worksheet
-        let ws = BIFFWorksheetBuilder.makeWorksheetStream(sheetName: sheet.name,
-                                                          headers: sheet.headers,
-                                                          rows: sheet.rows)
-        // 2) Workbook (globals + BOUNDSHEET)
-        let book = BIFFWorkbookBuilder.buildWorkbook(sheetName: sheet.name, worksheetData: ws)
-
-        // 3) OLE/CFB container with stream named "Book" (your reader accepts Workbook/Book)
-        try CFBWriter.writeSingleStream(streamName: "Book", stream: book, to: url)
+        let worksheet = BIFFWorksheetBuilder.makeWorksheetStream(
+            sheetName: sheet.name, headers: sheet.headers, rows: sheet.rows
+        )
+        let workbook = BIFFWorkbookBuilder.buildWorkbook(
+            sheetName: sheet.name, worksheetData: worksheet
+        )
+        try CFBWriter.writeSingleStream(streamName: "Book", stream: workbook, to: url)
     }
 }
