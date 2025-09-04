@@ -54,4 +54,3 @@ public enum XLSWriter {
     //    We'll wrap `workbookData` in an OLE container in Step 3.
     throw XLSWriteError.notImplemented("Step 2 complete. Next: OLE container in Step 3.")
 }
-}
